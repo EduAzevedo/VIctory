@@ -40,6 +40,9 @@ struct Journal {
     /// Page ranges that thread asked the kernel about in this sweep
     /// (sorted, disjoint, end exclusive).
     swept: Vec<(usize, usize)>,
+    /// Allocations asked about whole in sweeps, by first page: their end
+    /// page, and whether asking the kernel about them whole worked.
+    allocations: BTreeMap<usize, (usize, bool)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -48,6 +51,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
     sweeper: None,
     swept: Vec::new(),
+    allocations: BTreeMap::new(),
 });
 
 /// While alive, the calling thread prepares one submission: the title's
@@ -130,48 +134,43 @@ fn sweep_in(swept: &mut Vec<(usize, usize)>, first: usize, last: usize) {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // In a sweep, only what this thread has not asked about yet in it.
     let sweeping = j.sweeper == Some(std::thread::current().id());
-    let asks = if sweeping {
+    let mut asks = if sweeping {
         gaps(&j.swept, first, last)
     } else {
         vec![(first, last)]
     };
     let mut found: Vec<usize> = Vec::new();
-    let mut failed = false;
-    for &(a, e) in &asks {
-        let mut count = (e - a) * PAGE / KERNEL_PAGE;
-        j.found.resize(count.max(j.found.len()), 0);
-        let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        // SAFETY: the answer buffer holds `count` entries.
-        failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (a * PAGE) as *const _,
-                (e - a) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
+    // In a sweep, the first asking inside an allocation asks about all of
+    // it: the kernel can take as long for a page as for the whole allocation
+    // (about 2.2 ms for each of ~1,800 small askings a world frame into one
+    // 2.2 GB allocation on a Ryzen 7 5700G, 2026-11-24), and what it reports
+    // goes into the journal, so the sweep's later askings there need no
+    // kernel call. Every title write the submission must see was made before
+    // the sweep began, as the sweep itself already relies on.
+    if sweeping
+        && !asks.is_empty()
+        && whole_allocations()
+        && let Some((a, e)) = allocation(&mut j.allocations, start)
+        && a <= first
+        && last <= e
+    {
+        let whole = gaps(&j.swept, a, e);
+        if ask(&mut j.found, &whole, &mut found) {
+            for &(a, e) in &whole {
+                sweep_in(&mut j.swept, a, e);
+            }
+            asks = gaps(&j.swept, first, last);
+        } else if let Some(entry) = j.allocations.get_mut(&a) {
+            // Not watched as a whole (or no longer): per range from now on.
+            entry.1 = false;
         }
-        if failed {
-            break;
-        }
-        found.extend(j.found[..count].iter().map(|&at| at / PAGE));
     }
+    let failed = !ask(&mut j.found, &asks, &mut found);
     let guarded_pages = if failed {
         // A failed gap does not undo successful kernel queries, which
         // already reset their dirty bits. Leave the sweep coverage as is.
@@ -200,6 +199,90 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Whether sweeps ask about whole allocations (tests of the per-range
+/// path turn it off).
+fn whole_allocations() -> bool {
+    #[cfg(test)]
+    if tests::PER_RANGE.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    true
+}
+
+/// Asks the kernel about the page ranges `asks` (resetting their written
+/// bits) and adds the written pages to `found`, which keeps what earlier
+/// askings reported even when a later one fails. False if one failed.
+fn ask(answer: &mut Vec<usize>, asks: &[(usize, usize)], found: &mut Vec<usize>) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    for &(a, e) in asks {
+        let mut count = (e - a) * PAGE / KERNEL_PAGE;
+        answer.resize(count.max(answer.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (a * PAGE) as *const _,
+                (e - a) * PAGE,
+                answer.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        if failed {
+            return false;
+        }
+        found.extend(answer[..count].iter().map(|&at| at / PAGE));
+    }
+    true
+}
+
+/// The pages of the allocation `at` lies in (first, end exclusive), if it
+/// may be asked about whole: remembered per allocation, measured with
+/// `VirtualQuery` the first time.
+fn allocation(known: &mut BTreeMap<usize, (usize, bool)>, at: usize) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |at: usize| {
+        // SAFETY: plain data, filled by the call below.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+        // SAFETY: a query of our own address space into a local.
+        (unsafe { VirtualQuery(at as *const _, &mut info, size) } == size).then_some(info)
+    };
+    let here = query(at)?;
+    if here.State == MEM_FREE {
+        return None;
+    }
+    let base = here.AllocationBase as usize;
+    if !base.is_multiple_of(PAGE) {
+        return None;
+    }
+    let first = base / PAGE;
+    if let Some(&(end, whole)) = known.get(&first) {
+        return whole.then_some((first, end));
+    }
+    // Its regions from its base on, up to where another allocation starts.
+    let mut end = base;
+    while let Some(r) = query(end) {
+        if r.AllocationBase as usize != base || r.RegionSize == 0 {
+            break;
+        }
+        end += r.RegionSize;
+    }
+    let end = end.div_ceil(PAGE);
+    known.insert(first, (end, true));
+    Some((first, end))
 }
 
 /// Guarded blocks of view memory.
@@ -319,6 +402,8 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Allocations may have changed: measure them again.
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).allocations.clear();
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
@@ -392,6 +477,9 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
     static SWEEP_TEST: Mutex<()> = Mutex::new(());
+    /// Set by a test of the per-range path, under `SWEEP_TEST`.
+    pub(super) static PER_RANGE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -502,9 +590,51 @@ mod tests {
         drop(sweep);
     }
 
+    /// In a sweep, the first asking inside an allocation asks about all of
+    /// it: a page written elsewhere in the allocation is found by that
+    /// asking, seen by a later asking in the sweep without asking again, and
+    /// still seen after the sweep.
+    #[test]
+    fn a_sweep_asks_about_the_whole_allocation_once() {
+        let _serial = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let p = watched(4);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (p as *mut u8).write(1);
+            ((p + 3 * PAGE) as *mut u8).write(1);
+        }
+        let sweep = Sweep::begin();
+        let (first, head) = writes(p, p + PAGE, false).expect("watched");
+        assert_eq!(head, [(p / PAGE, first)]);
+        // Found by the first asking, not by one of its own.
+        let (_, tail) = writes(p + 3 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert_eq!(tail, [(p / PAGE + 3, first)]);
+        drop(sweep);
+        let (_, after) = writes(p + 3 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert_eq!(after, [(p / PAGE + 3, first)]);
+    }
+
+    /// Memory that is not write-watched answers nothing in a sweep either.
+    #[test]
+    fn a_sweep_over_unwatched_memory_answers_nothing() {
+        let _serial = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a fresh allocation without write watching, kept.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let sweep = Sweep::begin();
+        assert!(writes(p, p + PAGE, false).is_none());
+        assert!(writes(p + PAGE, p + 2 * PAGE, false).is_none());
+        drop(sweep);
+    }
+
     #[test]
     fn partial_sweep_keeps_writes_when_a_later_query_fails() {
         let _serial = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        // The per-range path: asked about whole, the first asking would
+        // already take the first page, before the write this test needs.
+        PER_RANGE.store(true, std::sync::atomic::Ordering::Relaxed);
         for guarded in [false, true] {
             let p = watched(2);
             let sweep = Sweep::begin();
@@ -517,6 +647,7 @@ mod tests {
             assert_eq!(pages[0].0, p / PAGE);
             drop(sweep);
         }
+        PER_RANGE.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
